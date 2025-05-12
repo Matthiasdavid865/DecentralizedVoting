@@ -338,3 +338,86 @@
 )
 
 
+
+
+
+(define-map token-lock-time
+    principal
+    uint
+)
+
+(define-constant WEIGHT-MULTIPLIER u2)
+(define-constant MAX-WEIGHT-MULTIPLIER u5)
+(define-constant BLOCKS-PER-MULTIPLIER u1000)
+
+(define-public (lock-tokens (lock-period uint))
+    (begin
+        (asserts! (>= (default-to u0 (map-get? eligible-voters tx-sender)) (var-get min-tokens)) ERR-NOT-ELIGIBLE)
+        (map-set token-lock-time tx-sender (+ stacks-block-height lock-period))
+        (ok true)
+    )
+)
+
+(define-public (time-weighted-vote (proposal-id uint) (vote-bool bool))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (voter-key { proposal-id: proposal-id, voter: tx-sender })
+            (voter-balance (default-to u0 (map-get? eligible-voters tx-sender)))
+            (lock-time (default-to u0 (map-get? token-lock-time tx-sender)))
+            (blocks-locked (if (> lock-time stacks-block-height) 
+                (- lock-time stacks-block-height) 
+                u0))
+            (weight-multiplier (if (> (+ WEIGHT-MULTIPLIER (/ blocks-locked BLOCKS-PER-MULTIPLIER)) MAX-WEIGHT-MULTIPLIER)
+                MAX-WEIGHT-MULTIPLIER
+                (+ WEIGHT-MULTIPLIER (/ blocks-locked BLOCKS-PER-MULTIPLIER))))
+            (weighted-balance (* voter-balance weight-multiplier))
+        )
+        (asserts! (>= voter-balance (var-get min-tokens)) ERR-NOT-ELIGIBLE)
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
+        (asserts! (is-none (map-get? voter-registry voter-key)) ERR-ALREADY-VOTED)
+        
+        (map-set voter-registry voter-key { voted: true })
+        
+        (if vote-bool
+            (map-set proposals proposal-id 
+                (merge proposal { yes-votes: (+ (get yes-votes proposal) weighted-balance) }))
+            (map-set proposals proposal-id 
+                (merge proposal { no-votes: (+ (get no-votes proposal) weighted-balance) }))
+        )
+        (ok true)
+    )
+)
+
+
+(define-map proposal-tags
+    { proposal-id: uint, tag: (string-ascii 20) }
+    bool
+)
+
+(define-map tag-registry
+    (string-ascii 20)
+    bool
+)
+
+(define-public (register-tag (tag (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (map-set tag-registry tag true)
+        (ok true)
+    )
+)
+
+(define-public (add-proposal-tag (proposal-id uint) (tag (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (map-get? proposals proposal-id)) ERR-INVALID-PROPOSAL)
+        (asserts! (default-to false (map-get? tag-registry tag)) ERR-NOT-AUTHORIZED)
+        (map-set proposal-tags { proposal-id: proposal-id, tag: tag } true)
+        (ok true)
+    )
+)
+
+(define-read-only (has-tag (proposal-id uint) (tag (string-ascii 20)))
+    (default-to false (map-get? proposal-tags { proposal-id: proposal-id, tag: tag }))
+)
