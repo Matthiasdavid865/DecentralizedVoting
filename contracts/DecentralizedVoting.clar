@@ -421,3 +421,202 @@
 (define-read-only (has-tag (proposal-id uint) (tag (string-ascii 20)))
     (default-to false (map-get? proposal-tags { proposal-id: proposal-id, tag: tag }))
 )
+
+
+(define-constant ERR-INVALID-STAGE (err u110))
+(define-constant ERR-STAGE-NOT-READY (err u111))
+
+(define-map proposal-stages
+    uint
+    {
+        current-stage: uint,
+        stage-end-block: uint,
+        total-stages: uint,
+        stage-names: (list 5 (string-ascii 20))
+    }
+)
+
+(define-map stage-votes
+    { proposal-id: uint, stage: uint, voter: principal }
+    { vote: bool, weight: uint }
+)
+
+(define-map stage-results
+    { proposal-id: uint, stage: uint }
+    { yes-votes: uint, no-votes: uint, status: (string-ascii 10) }
+)
+
+(define-public (create-multi-stage-proposal 
+    (title (string-ascii 50)) 
+    (description (string-ascii 500)) 
+    (stage-durations (list 5 uint))
+    (stage-names (list 5 (string-ascii 20))))
+    (let
+        (
+            (new-id (+ (var-get total-proposals) u1))
+            (first-stage-duration (unwrap! (element-at stage-durations u0) ERR-INVALID-PROPOSAL))
+            (end-block (+ stacks-block-height first-stage-duration))
+            (total-stages (len stage-durations))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> total-stages u0) ERR-INVALID-PROPOSAL)
+        (asserts! (is-eq (len stage-names) total-stages) ERR-INVALID-PROPOSAL)
+        
+
+        
+        (map-set proposal-stages new-id
+            {
+                current-stage: u0,
+                stage-end-block: end-block,
+                total-stages: total-stages,
+                stage-names: stage-names
+            }
+        )
+        
+        (map-set stage-results 
+            { proposal-id: new-id, stage: u0 }
+            { yes-votes: u0, no-votes: u0, status: "active" }
+        )
+        
+        (var-set total-proposals new-id)
+        (ok new-id)
+    )
+)
+
+(define-public (vote-in-stage (proposal-id uint) (vote-bool bool))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (stage-info (unwrap! (map-get? proposal-stages proposal-id) ERR-INVALID-STAGE))
+            (current-stage (get current-stage stage-info))
+            (voter-balance (default-to u0 (map-get? eligible-voters tx-sender)))
+            (stage-voter-key { proposal-id: proposal-id, stage: current-stage, voter: tx-sender })
+            (stage-result-key { proposal-id: proposal-id, stage: current-stage })
+            (current-results (unwrap! (map-get? stage-results stage-result-key) ERR-INVALID-STAGE))
+        )
+        (asserts! (>= voter-balance (var-get min-tokens)) ERR-NOT-ELIGIBLE)
+        (asserts! (< stacks-block-height (get stage-end-block stage-info)) ERR-VOTING-ENDED)
+        (asserts! (is-eq (get status proposal) "multi-stage") ERR-INVALID-STAGE)
+        (asserts! (is-none (map-get? stage-votes stage-voter-key)) ERR-ALREADY-VOTED)
+        
+        (map-set stage-votes stage-voter-key 
+            { vote: vote-bool, weight: voter-balance }
+        )
+        
+        (if vote-bool
+            (map-set stage-results stage-result-key
+                (merge current-results 
+                    { yes-votes: (+ (get yes-votes current-results) voter-balance) }
+                )
+            )
+            (map-set stage-results stage-result-key
+                (merge current-results 
+                    { no-votes: (+ (get no-votes current-results) voter-balance) }
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (advance-to-next-stage (proposal-id uint) (next-stage-duration uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (stage-info (unwrap! (map-get? proposal-stages proposal-id) ERR-INVALID-STAGE))
+            (current-stage (get current-stage stage-info))
+            (next-stage (+ current-stage u1))
+            (stage-result-key { proposal-id: proposal-id, stage: current-stage })
+            (current-results (unwrap! (map-get? stage-results stage-result-key) ERR-INVALID-STAGE))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (>= stacks-block-height (get stage-end-block stage-info)) ERR-STAGE-NOT-READY)
+        (asserts! (< next-stage (get total-stages stage-info)) ERR-INVALID-STAGE)
+        
+        (map-set stage-results stage-result-key
+            (merge current-results { status: "completed" })
+        )
+        
+        (map-set proposal-stages proposal-id
+            (merge stage-info 
+                {
+                    current-stage: next-stage,
+                    stage-end-block: (+ stacks-block-height next-stage-duration)
+                }
+            )
+        )
+        
+        (map-set stage-results 
+            { proposal-id: proposal-id, stage: next-stage }
+            { yes-votes: u0, no-votes: u0, status: "active" }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (finalize-multi-stage-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (stage-info (unwrap! (map-get? proposal-stages proposal-id) ERR-INVALID-STAGE))
+            (current-stage (get current-stage stage-info))
+            (final-stage (- (get total-stages stage-info) u1))
+            (stage-result-key { proposal-id: proposal-id, stage: current-stage })
+            (final-results (unwrap! (map-get? stage-results stage-result-key) ERR-INVALID-STAGE))
+        )
+        (asserts! (>= stacks-block-height (get stage-end-block stage-info)) ERR-VOTING-NOT-ENDED)
+        (asserts! (is-eq current-stage final-stage) ERR-INVALID-STAGE)
+        (asserts! (is-eq (get status proposal) "multi-stage") ERR-VOTING-ENDED)
+        
+        (map-set proposals proposal-id
+            (merge proposal 
+                {
+                    status: (if (> (get yes-votes final-results) (get no-votes final-results))
+                        "passed"
+                        "rejected"
+                    ),
+                    yes-votes: (get yes-votes final-results),
+                    no-votes: (get no-votes final-results)
+                }
+            )
+        )
+        
+        (map-set stage-results stage-result-key
+            (merge final-results { status: "finalized" })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-proposal-stage-info (proposal-id uint))
+    (map-get? proposal-stages proposal-id)
+)
+
+(define-read-only (get-stage-results (proposal-id uint) (stage uint))
+    (map-get? stage-results { proposal-id: proposal-id, stage: stage })
+)
+
+(define-read-only (get-stage-vote (proposal-id uint) (stage uint) (voter principal))
+    (map-get? stage-votes { proposal-id: proposal-id, stage: stage, voter: voter })
+)
+
+(define-read-only (has-voted-in-current-stage (proposal-id uint) (voter principal))
+    (let
+        (
+            (stage-info (map-get? proposal-stages proposal-id))
+        )
+        (match stage-info
+            stage-data 
+                (is-some (map-get? stage-votes 
+                    { 
+                        proposal-id: proposal-id, 
+                        stage: (get current-stage stage-data), 
+                        voter: voter 
+                    }
+                ))
+            false
+        )
+    )
+)
