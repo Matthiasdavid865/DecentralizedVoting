@@ -39,6 +39,208 @@
 
 ;; Public Functions
 
+(define-constant ERR-EXECUTION-FAILED (err u112))
+(define-constant ERR-EXECUTION-UNAUTHORIZED (err u113))
+(define-constant ERR-EXECUTION-ALREADY-DONE (err u114))
+(define-constant ERR-INVALID-EXECUTION-TARGET (err u115))
+(define-constant ERR-EXECUTION-WINDOW-EXPIRED (err u116))
+
+(define-map execution-targets
+    (string-ascii 30)
+    {
+        contract-address: principal,
+        function-name: (string-ascii 30),
+        authorized: bool
+    }
+)
+
+(define-map executable-proposals
+    uint
+    {
+        execution-target: (string-ascii 30),
+        execution-parameters: (list 5 uint),
+        execution-window: uint,
+        auto-execute: bool
+    }
+)
+
+(define-map execution-history
+    uint
+    {
+        executed: bool,
+        execution-block: uint,
+        execution-result: (string-ascii 20),
+        executor: principal
+    }
+)
+
+(define-public (register-execution-target 
+    (target-name (string-ascii 30)) 
+    (contract-address principal) 
+    (function-name (string-ascii 30)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (map-set execution-targets target-name
+            {
+                contract-address: contract-address,
+                function-name: function-name,
+                authorized: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-executable-proposal 
+    (title (string-ascii 50)) 
+    (description (string-ascii 500)) 
+    (blocks uint)
+    (execution-target (string-ascii 30))
+    (execution-parameters (list 5 uint))
+    (execution-window uint)
+    (auto-execute bool))
+    (let
+        (
+            (new-id (+ (var-get total-proposals) u1))
+            (end-block (+ stacks-block-height blocks))
+            (target-info (map-get? execution-targets execution-target))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some target-info) ERR-INVALID-EXECUTION-TARGET)
+        (asserts! (get authorized (unwrap-panic target-info)) ERR-EXECUTION-UNAUTHORIZED)
+        
+        (map-set proposals new-id
+            {
+                title: title,
+                description: description,
+                creator: tx-sender,
+                end-block: end-block,
+                yes-votes: u0,
+                no-votes: u0,
+                status: "active"
+            }
+        )
+        
+        (map-set executable-proposals new-id
+            {
+                execution-target: execution-target,
+                execution-parameters: execution-parameters,
+                execution-window: execution-window,
+                auto-execute: auto-execute
+            }
+        )
+        
+        (var-set total-proposals new-id)
+        (ok new-id)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (executable-info (unwrap! (map-get? executable-proposals proposal-id) ERR-INVALID-EXECUTION-TARGET))
+            (execution-record (map-get? execution-history proposal-id))
+            (target-info (unwrap! (map-get? execution-targets (get execution-target executable-info)) ERR-INVALID-EXECUTION-TARGET))
+            (execution-deadline (+ (get end-block proposal) (get execution-window executable-info)))
+        )
+        (asserts! (is-eq (get status proposal) "passed") ERR-EXECUTION-UNAUTHORIZED)
+        (asserts! (< stacks-block-height execution-deadline) ERR-EXECUTION-WINDOW-EXPIRED)
+        (asserts! (is-none execution-record) ERR-EXECUTION-ALREADY-DONE)
+        (asserts! (get authorized target-info) ERR-EXECUTION-UNAUTHORIZED)
+        
+        (map-set execution-history proposal-id
+            {
+                executed: true,
+                execution-block: stacks-block-height,
+                execution-result: "success",
+                executor: tx-sender
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (schedule-execution (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (executable-info (unwrap! (map-get? executable-proposals proposal-id) ERR-INVALID-EXECUTION-TARGET))
+        )
+        (asserts! (is-eq (get status proposal) "passed") ERR-EXECUTION-UNAUTHORIZED)
+        (asserts! (get auto-execute executable-info) ERR-EXECUTION-UNAUTHORIZED)
+        
+        (execute-proposal proposal-id)
+    )
+)
+
+(define-public (revoke-execution-target (target-name (string-ascii 30)))
+    (let
+        (
+            (target-info (unwrap! (map-get? execution-targets target-name) ERR-INVALID-EXECUTION-TARGET))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        
+        (map-set execution-targets target-name
+            (merge target-info { authorized: false })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-execution-target (target-name (string-ascii 30)))
+    (map-get? execution-targets target-name)
+)
+
+(define-read-only (get-executable-proposal-info (proposal-id uint))
+    (map-get? executable-proposals proposal-id)
+)
+
+(define-read-only (get-execution-history (proposal-id uint))
+    (map-get? execution-history proposal-id)
+)
+
+(define-read-only (is-execution-window-active (proposal-id uint))
+    (let
+        (
+            (proposal (map-get? proposals proposal-id))
+            (executable-info (map-get? executable-proposals proposal-id))
+        )
+        (match proposal
+            prop-data
+                (match executable-info
+                    exec-data
+                        (let
+                            (
+                                (execution-deadline (+ (get end-block prop-data) (get execution-window exec-data)))
+                            )
+                            (and
+                                (is-eq (get status prop-data) "passed")
+                                (< stacks-block-height execution-deadline)
+                                (is-none (map-get? execution-history proposal-id))
+                            )
+                        )
+                    false
+                )
+            false
+        )
+    )
+)
+
+(define-read-only (get-pending-executions)
+    (let
+        (
+            (total-props (var-get total-proposals))
+        )
+        (filter is-execution-pending (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+    )
+)
+
+(define-read-only (is-execution-pending (proposal-id uint))
+    (is-execution-window-active proposal-id)
+)
+
 ;; Create a new proposal
 (define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 500)) (blocks uint))
     (let
