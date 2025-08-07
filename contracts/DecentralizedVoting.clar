@@ -822,3 +822,349 @@
         )
     )
 )
+
+;; Dynamic Reputation-Based Voting Power System
+;; Tracks voter performance and adjusts voting power based on historical accuracy
+
+;; Constants for reputation system
+(define-constant INITIAL-REPUTATION u1000)
+(define-constant MIN-REPUTATION u100)
+(define-constant MAX-REPUTATION u5000)
+(define-constant REPUTATION-BOOST u150)
+(define-constant REPUTATION-PENALTY u100)
+(define-constant DECAY-RATE u5) ;; reputation decay per 1000 blocks
+(define-constant PARTICIPATION-BONUS u25)
+(define-constant ERR-REPUTATION-TOO-LOW (err u120))
+
+;; Reputation data structures
+(define-map voter-reputation
+    principal
+    {
+        current-score: uint,
+        total-votes: uint,
+        correct-predictions: uint,
+        last-activity: uint,
+        participation-streak: uint
+    }
+)
+
+;; Tracks individual vote outcomes for reputation calculation
+(define-map vote-outcomes
+    { proposal-id: uint, voter: principal }
+    {
+        vote-cast: bool,
+        outcome-correct: bool,
+        reputation-applied: bool
+    }
+)
+
+;; Reputation multiplier tiers
+(define-map reputation-tiers
+    uint
+    {
+        min-score: uint,
+        max-score: uint,
+        power-multiplier: uint,
+        tier-name: (string-ascii 20)
+    }
+)
+
+;; Initialize reputation system with default tiers
+(define-public (initialize-reputation-tiers)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        
+        ;; Tier 1: Novice (100-499)
+        (map-set reputation-tiers u1 
+            { min-score: u100, max-score: u499, power-multiplier: u50, tier-name: "novice" })
+        
+        ;; Tier 2: Standard (500-999)  
+        (map-set reputation-tiers u2
+            { min-score: u500, max-score: u999, power-multiplier: u75, tier-name: "standard" })
+        
+        ;; Tier 3: Experienced (1000-1999)
+        (map-set reputation-tiers u3
+            { min-score: u1000, max-score: u1999, power-multiplier: u100, tier-name: "experienced" })
+        
+        ;; Tier 4: Expert (2000-3499)
+        (map-set reputation-tiers u4
+            { min-score: u2000, max-score: u3499, power-multiplier: u125, tier-name: "expert" })
+        
+        ;; Tier 5: Master (3500+)
+        (map-set reputation-tiers u5
+            { min-score: u3500, max-score: u5000, power-multiplier: u150, tier-name: "master" })
+        
+        (ok true)
+    )
+)
+
+;; Initialize voter reputation when they first register
+(define-public (initialize-voter-reputation (voter principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (map-get? voter-reputation voter)) ERR-ALREADY-VOTED)
+        
+        (map-set voter-reputation voter
+            {
+                current-score: INITIAL-REPUTATION,
+                total-votes: u0,
+                correct-predictions: u0,
+                last-activity: stacks-block-height,
+                participation-streak: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Calculate reputation-adjusted voting power
+(define-read-only (get-reputation-voting-power (voter principal))
+    (let
+        (
+            (base-balance (default-to u0 (map-get? eligible-voters voter)))
+            (reputation-data (map-get? voter-reputation voter))
+        )
+        (match reputation-data
+            rep-data
+                (let
+                    (
+                        (current-rep (get current-score rep-data))
+                        (power-multiplier (get-reputation-multiplier current-rep))
+                    )
+                    (* base-balance (/ power-multiplier u100))
+                )
+            base-balance
+        )
+    )
+)
+
+;; Get reputation multiplier based on current score
+(define-read-only (get-reputation-multiplier (reputation-score uint))
+    (let
+        (
+            (tier-1 (map-get? reputation-tiers u1))
+            (tier-2 (map-get? reputation-tiers u2))
+            (tier-3 (map-get? reputation-tiers u3))
+            (tier-4 (map-get? reputation-tiers u4))
+            (tier-5 (map-get? reputation-tiers u5))
+        )
+        (if (<= reputation-score u499)
+            (get power-multiplier (unwrap-panic tier-1))
+            (if (<= reputation-score u999)
+                (get power-multiplier (unwrap-panic tier-2))
+                (if (<= reputation-score u1999)
+                    (get power-multiplier (unwrap-panic tier-3))
+                    (if (<= reputation-score u3499)
+                        (get power-multiplier (unwrap-panic tier-4))
+                        (get power-multiplier (unwrap-panic tier-5))
+                    )
+                )
+            )
+        )
+    )
+)
+
+;; Enhanced voting function with reputation-based power
+(define-public (reputation-vote (proposal-id uint) (vote-bool bool))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (voter-key { proposal-id: proposal-id, voter: tx-sender })
+            (base-balance (default-to u0 (map-get? eligible-voters tx-sender)))
+            (reputation-power (get-reputation-voting-power tx-sender))
+            (reputation-data (map-get? voter-reputation tx-sender))
+        )
+        ;; Check basic eligibility
+        (asserts! (>= base-balance (var-get min-tokens)) ERR-NOT-ELIGIBLE)
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
+        (asserts! (is-none (map-get? voter-registry voter-key)) ERR-ALREADY-VOTED)
+        
+        ;; Ensure voter has reputation record
+        (asserts! (is-some reputation-data) ERR-REPUTATION-TOO-LOW)
+        
+        ;; Check minimum reputation requirement
+        (asserts! (>= (get current-score (unwrap-panic reputation-data)) MIN-REPUTATION) ERR-REPUTATION-TOO-LOW)
+        
+        ;; Record vote in registry
+        (map-set voter-registry voter-key { voted: true })
+        
+        ;; Store vote outcome for later reputation update
+        (map-set vote-outcomes voter-key
+            {
+                vote-cast: vote-bool,
+                outcome-correct: false,
+                reputation-applied: false
+            }
+        )
+        
+        ;; Apply reputation-adjusted vote weight
+        (if vote-bool
+            (map-set proposals proposal-id 
+                (merge proposal { yes-votes: (+ (get yes-votes proposal) reputation-power) }))
+            (map-set proposals proposal-id 
+                (merge proposal { no-votes: (+ (get no-votes proposal) reputation-power) }))
+        )
+        
+        ;; Update voter activity
+        (update-voter-activity tx-sender)
+        
+        (ok true)
+    )
+)
+
+;; Update voter activity and participation streak
+(define-private (update-voter-activity (voter principal))
+    (let
+        (
+            (reputation-data (unwrap! (map-get? voter-reputation voter) false))
+            (blocks-since-activity (- stacks-block-height (get last-activity reputation-data)))
+            (new-streak (if (< blocks-since-activity u1000) 
+                (+ (get participation-streak reputation-data) u1)
+                u1))
+        )
+        (map-set voter-reputation voter
+            (merge reputation-data
+                {
+                    total-votes: (+ (get total-votes reputation-data) u1),
+                    last-activity: stacks-block-height,
+                    participation-streak: new-streak
+                }
+            )
+        )
+        true
+    )
+)
+
+;; Process reputation updates after proposal finalization
+(define-public (process-reputation-updates (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (proposal-passed (is-eq (get status proposal) "passed"))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (or (is-eq (get status proposal) "passed") (is-eq (get status proposal) "rejected")) ERR-VOTING-NOT-ENDED)
+        
+        ;; This would process all voters - simplified for demonstration
+        (ok true)
+    )
+)
+
+;; Update individual voter reputation after proposal outcome
+(define-public (update-voter-reputation (proposal-id uint) (voter principal))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (vote-outcome-key { proposal-id: proposal-id, voter: voter })
+            (vote-data (unwrap! (map-get? vote-outcomes vote-outcome-key) ERR-INVALID-PROPOSAL))
+            (reputation-data (unwrap! (map-get? voter-reputation voter) ERR-NOT-ELIGIBLE))
+            (proposal-passed (is-eq (get status proposal) "passed"))
+            (voter-correct (is-eq (get vote-cast vote-data) proposal-passed))
+        )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get reputation-applied vote-data)) ERR-ALREADY-VOTED)
+        
+        ;; Calculate reputation change
+        (let
+            (
+                (reputation-change (if voter-correct REPUTATION-BOOST REPUTATION-PENALTY))
+                (participation-bonus (if (> (get participation-streak reputation-data) u5) PARTICIPATION-BONUS u0))
+                (new-score (if voter-correct
+                    (+ (get current-score reputation-data) reputation-change participation-bonus)
+                    (if (> (get current-score reputation-data) (+ MIN-REPUTATION reputation-change))
+                        (- (get current-score reputation-data) reputation-change)
+                        MIN-REPUTATION)))
+                (final-score (if (> new-score MAX-REPUTATION) MAX-REPUTATION new-score))
+            )
+            ;; Update reputation
+            (map-set voter-reputation voter
+                (merge reputation-data
+                    {
+                        current-score: final-score,
+                        correct-predictions: (if voter-correct 
+                            (+ (get correct-predictions reputation-data) u1)
+                            (get correct-predictions reputation-data))
+                    }
+                )
+            )
+            
+            ;; Mark reputation as applied
+            (map-set vote-outcomes vote-outcome-key
+                (merge vote-data { outcome-correct: voter-correct, reputation-applied: true })
+            )
+            
+            (ok final-score)
+        )
+    )
+)
+
+;; Apply reputation decay over time
+(define-public (apply-reputation-decay (voter principal))
+    (let
+        (
+            (reputation-data (unwrap! (map-get? voter-reputation voter) ERR-NOT-ELIGIBLE))
+            (blocks-inactive (- stacks-block-height (get last-activity reputation-data)))
+            (decay-periods (/ blocks-inactive u1000))
+            (total-decay (* decay-periods DECAY-RATE))
+            (new-score (if (> (get current-score reputation-data) total-decay)
+                (- (get current-score reputation-data) total-decay)
+                MIN-REPUTATION))
+        )
+        (asserts! (> blocks-inactive u1000) ERR-NOT-AUTHORIZED)
+        
+        (map-set voter-reputation voter
+            (merge reputation-data { current-score: new-score })
+        )
+        (ok new-score)
+    )
+)
+
+;; Get voter's current reputation info
+(define-read-only (get-voter-reputation (voter principal))
+    (map-get? voter-reputation voter)
+)
+
+;; Get voter's reputation tier information
+(define-read-only (get-voter-tier (voter principal))
+    (let
+        (
+            (reputation-data (map-get? voter-reputation voter))
+        )
+        (match reputation-data
+            rep-data
+                (let
+                    (
+                        (current-rep (get current-score rep-data))
+                    )
+                    (if (<= current-rep u499)
+                        (map-get? reputation-tiers u1)
+                        (if (<= current-rep u999)
+                            (map-get? reputation-tiers u2)
+                            (if (<= current-rep u1999)
+                                (map-get? reputation-tiers u3)
+                                (if (<= current-rep u3499)
+                                    (map-get? reputation-tiers u4)
+                                    (map-get? reputation-tiers u5)
+                                )
+                            )
+                        )
+                    )
+                )
+            none
+        )
+    )
+)
+
+;; Get reputation statistics for the system
+(define-read-only (get-reputation-stats)
+    {
+        initial-reputation: INITIAL-REPUTATION,
+        min-reputation: MIN-REPUTATION,
+        max-reputation: MAX-REPUTATION,
+        reputation-boost: REPUTATION-BOOST,
+        reputation-penalty: REPUTATION-PENALTY,
+        decay-rate: DECAY-RATE
+    }
+)
+
+
