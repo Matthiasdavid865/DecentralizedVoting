@@ -1,0 +1,24 @@
+[project]
+name = 'DecentralizedVoting'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.DecentralizedVoting]
+path = 'contracts/DecentralizedVoting.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.voting-incentives]
+path = 'contracts/voting-incentives.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
